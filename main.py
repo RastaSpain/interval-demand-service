@@ -140,6 +140,8 @@ def calc_interval_demand(req: CalcRequest) -> Dict[str, Any]:
             "forecast_units": round(total_forecast, 2),
             "order_qty": round(sum(r["order_qty"] for r in rows), 2)
         }
+        }
+    
 @app.get("/debug/sample")
 def debug_sample(market: str = "", start: str = "", end: str = "", limit: int = 5):
     if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_DAILY]):
@@ -173,5 +175,4 @@ def debug_sample(market: str = "", start: str = "", end: str = "", limit: int = 
         "count": len(recs),
     }
 
-    }
 
