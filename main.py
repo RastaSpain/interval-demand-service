@@ -140,4 +140,38 @@ def calc_interval_demand(req: CalcRequest) -> Dict[str, Any]:
             "forecast_units": round(total_forecast, 2),
             "order_qty": round(sum(r["order_qty"] for r in rows), 2)
         }
+@app.get("/debug/sample")
+def debug_sample(market: str = "", start: str = "", end: str = "", limit: int = 5):
+    if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_DAILY]):
+        raise HTTPException(status_code=500, detail="Airtable env vars missing.")
+
+    api = Api(AIRTABLE_API_KEY)
+    table = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_DAILY)
+
+    formula_parts = []
+    if market:
+        formula_parts.append(f"{{{F_MARKET}}} = '{market}'")
+    if start:
+        formula_parts.append(f"{{{F_DATE}}} >= '{start}'")
+    if end:
+        formula_parts.append(f"{{{F_DATE}}} <= '{end}'")
+
+    formula = f"AND({','.join(formula_parts)})" if formula_parts else None
+
+    recs = table.all(
+        formula=formula,
+        max_records=limit,
+        fields=[F_DATE, F_LISTING_ID, F_MARKET, F_FORECAST]
+    )
+
+    # вернём только fields, чтобы было читабельно
+    return {
+        "table": AIRTABLE_TABLE_DAILY,
+        "fields_used": [F_DATE, F_LISTING_ID, F_MARKET, F_FORECAST],
+        "formula": formula,
+        "sample": [r.get("fields", {}) for r in recs],
+        "count": len(recs),
     }
+
+    }
+
