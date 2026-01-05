@@ -85,24 +85,48 @@ def debug_box_data():
         table_pm = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_PRODUCTMARKET)
         pm_rec = table_pm.get(test_listing_id)
         
-        # Загружаем все Box records
+        # Загружаем все Box records БЕЗ фильтра полей
         table_box = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_BOX)
-        box_records = table_box.all(fields=["Кол-во в коробке"])
+        box_records_all = table_box.all()
         
-        # Строим маппинг
+        # Загружаем с фильтром
+        box_records_filtered = table_box.all(fields=["Кол-во в коробке"])
+        
+        # Строим маппинг с полными записями
         from cartonization import build_box_map_from_productmarket
-        box_map = build_box_map_from_productmarket([pm_rec], box_records)
+        box_map_full = build_box_map_from_productmarket([pm_rec], box_records_all)
+        box_map_filtered = build_box_map_from_productmarket([pm_rec], box_records_filtered)
+        
+        # Получаем box_ids из pm_rec
+        pm_box_ids = pm_rec.get("fields", {}).get("Product and Box sizes cm", [])
+        
+        # Находим конкретную коробку
+        target_box = None
+        if pm_box_ids and len(pm_box_ids) > 0:
+            target_box_id = pm_box_ids[0]
+            for box_rec in box_records_all:
+                if box_rec.get("id") == target_box_id:
+                    target_box = box_rec
+                    break
         
         return {
             "test_listing_id": test_listing_id,
-            "productmarket_record": pm_rec,
-            "box_records_count": len(box_records),
-            "box_map": box_map,
-            "result": box_map.get(test_listing_id)
+            "pm_box_ids": pm_box_ids,
+            "target_box": target_box,
+            "box_records_all_count": len(box_records_all),
+            "box_records_filtered_count": len(box_records_filtered),
+            "box_records_all_sample": box_records_all[:2] if box_records_all else [],
+            "box_records_filtered_sample": box_records_filtered[:2] if box_records_filtered else [],
+            "box_map_full": box_map_full,
+            "box_map_filtered": box_map_filtered,
+            "result_full": box_map_full.get(test_listing_id),
+            "result_filtered": box_map_filtered.get(test_listing_id)
         }
     except Exception as e:
+        import traceback
         return {
             "error": str(e),
+            "traceback": traceback.format_exc(),
             "test_listing_id": test_listing_id
         }
 
