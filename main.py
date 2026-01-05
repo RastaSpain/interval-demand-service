@@ -64,6 +64,49 @@ def health():
     return {"ok": True}
 
 
+@app.get("/debug/box-data")
+def debug_box_data():
+    """
+    Debug endpoint - показывает какие данные о коробках загружаются
+    """
+    if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID]):
+        raise HTTPException(
+            status_code=500,
+            detail="Airtable environment variables are not fully configured."
+        )
+    
+    api = Api(AIRTABLE_API_KEY)
+    
+    # Тестовый listing_id
+    test_listing_id = "rec01nlDFcKrEgoEv"
+    
+    try:
+        # Загружаем ProductMarket
+        table_pm = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_PRODUCTMARKET)
+        pm_rec = table_pm.get(test_listing_id)
+        
+        # Загружаем все Box records
+        table_box = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_BOX)
+        box_records = table_box.all(fields=["Кол-во в коробке"])
+        
+        # Строим маппинг
+        from cartonization import build_box_map_from_productmarket
+        box_map = build_box_map_from_productmarket([pm_rec], box_records)
+        
+        return {
+            "test_listing_id": test_listing_id,
+            "productmarket_record": pm_rec,
+            "box_records_count": len(box_records),
+            "box_map": box_map,
+            "result": box_map.get(test_listing_id)
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "test_listing_id": test_listing_id
+        }
+
+
 @app.post("/calc/interval-demand")
 def calc_interval_demand(req: CalcRequest) -> Dict[str, Any]:
     """
