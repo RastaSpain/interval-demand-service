@@ -1,12 +1,13 @@
 import os
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
+import math
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from pyairtable import Api
 
-app = FastAPI(title="Interval Demand Calculator", version="1.1.0")
+app = FastAPI(title="Interval Demand Calculator", version="1.2.0")
 
 # ======================
 # ENV CONFIG
@@ -22,6 +23,17 @@ F_MARKET = os.getenv(
     "Marketplace (from Marketplace) (from Listing ID)"
 )
 F_FORECAST = os.getenv("AIRTABLE_FIELD_FORECAST", "Planned units")
+
+# --- NEW: tables for cartonization ---
+AIRTABLE_TABLE_PRODUCTMARKET = os.getenv("AIRTABLE_TABLE_PRODUCTMARKET", "ProductMarket")
+AIRTABLE_TABLE_PRODUCTS = os.getenv("AIRTABLE_TABLE_PRODUCTS", "Products")
+AIRTABLE_TABLE_BOXES = os.getenv("AIRTABLE_TABLE_BOXES", "Shiping Box sizes cm")
+
+# --- NEW: field names (override via ENV if needed) ---
+PM_FIELD_PRODUCT_LINK = os.getenv("AIRTABLE_PM_FIELD_PRODUCT_LINK", "Product")
+BOX_FIELD_PRODUCTS_LINK = os.getenv("AIRTABLE_BOX_FIELD_PRODUCTS_LINK", "Products")
+BOX_FIELD_UNITS = os.getenv("AIRTABLE_BOX_FIELD_UNITS", "Кол-во в коробке")
+PRODUCTS_FIELD_PRODUCT_ID = os.getenv("AIRTABLE_PRODUCTS_FIELD_PRODUCT_ID", "Product ID")
 
 # Optional: lightweight protection for debug endpoints
 DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "")  # set in Railway Variables if you want
@@ -55,11 +67,23 @@ def build_date_filter(start: str, end_exclusive: str) -> str:
     )
 
 
-def get_airtable_table():
-    if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_DAILY]):
+def get_airtable_api() -> Api:
+    if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID]):
         raise HTTPException(status_code=500, detail="Airtable environment variables are not fully configured.")
-    api = Api(AIRTABLE_API_KEY)
+    return Api(AIRTABLE_API_KEY)
+
+
+def get_airtable_table_daily():
+    if not AIRTABLE_TABLE_DAILY:
+        raise HTTPException(status_code=500, detail="AIRTABLE_TABLE_DAILY is not configured.")
+    api = get_airtable_api()
     return api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_DAILY)
+
+
+# --- NEW: helpers to access other tables ---
+def get_airtable_table(name: str):
+    api = get_airtable_api()
+    return api.table(AIRTABLE_BASE_ID, name)
 
 
 def as_list(value) -> List[Any]:
@@ -86,8 +110,10 @@ def health():
     return {"ok": True}
 
 
-@app.post("/calc/interval-demand")
-def calc_interval_demand(req: CalcRequest) -> Dict[str, Any]:
+# ======================
+# CORE CALC (existing)
+# ======================
+def _calc_interval_demand_internal(req: CalcRequest) -> Dict[str, Any]:
     start_dt = parse_date(req.interval_start)
     end_dt = parse_date(req.interval_end)
     if end_dt < start_dt:
@@ -96,11 +122,9 @@ def calc_interval_demand(req: CalcRequest) -> Dict[str, Any]:
     start_str = start_dt.strftime("%Y-%m-%d")
     end_exclusive = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    table = get_airtable_table()
-
+    table = get_airtable_table_daily()
     formula = build_date_filter(start_str, end_exclusive)
 
-    # Pull only needed fields
     records = table.all(
         formula=formula,
         fields=[F_DATE, F_LISTING_ID, F_MARKET, F_FORECAST],
@@ -111,17 +135,14 @@ def calc_interval_demand(req: CalcRequest) -> Dict[str, Any]:
     for r in records:
         f = r.get("fields", {})
 
-        # Market is LIST (lookup/linked). Example: ["USA"]
         markets = as_list(f.get(F_MARKET))
         if req.market not in markets:
             continue
 
-        # Listing ID also comes as LIST. Example: ["recmZ0LLMczkduqX2"]
-        listing_id = first_or_none(f.get(F_LISTING_ID))
+        listing_id = first_or_none(f.get(F_LISTING_ID))  # record id of ProductMarket
         if not listing_id:
             continue
 
-        # Planned units should be numeric; handle None/strings safely
         raw_units = f.get(F_FORECAST, 0)
         try:
             units = float(raw_units or 0)
@@ -168,6 +189,213 @@ def calc_interval_demand(req: CalcRequest) -> Dict[str, Any]:
     }
 
 
+@app.post("/calc/interval-demand")
+def calc_interval_demand(req: CalcRequest) -> Dict[str, Any]:
+    return _calc_interval_demand_internal(req)
+
+
+# ======================
+# --- NEW: CARTONIZATION
+# ======================
+
+def chunked(lst: List[str], size: int) -> List[List[str]]:
+    return [lst[i:i + size] for i in range(0, len(lst), size)]
+
+
+def fetch_productmarket_listing_to_product(listing_ids: List[str]) -> Dict[str, str]:
+    """
+    listing_id (ProductMarket record id) -> product_rec_id (Products record id)
+    """
+    if not listing_ids:
+        return {}
+
+    pm_table = get_airtable_table(AIRTABLE_TABLE_PRODUCTMARKET)
+    out: Dict[str, str] = {}
+
+    # Airtable formula size is limited — бьём на чанки
+    for chunk in chunked(listing_ids, 50):
+        or_part = ",".join([f"RECORD_ID()='{rid}'" for rid in chunk])
+        formula = f"OR({or_part})"
+
+        recs = pm_table.all(formula=formula, fields=[PM_FIELD_PRODUCT_LINK])
+        for r in recs:
+            rid = r.get("id")
+            fields = r.get("fields", {}) or {}
+            prod_rec = first_or_none(fields.get(PM_FIELD_PRODUCT_LINK))
+            if rid and prod_rec:
+                out[rid] = prod_rec
+
+    return out
+
+
+def fetch_products_product_id(product_rec_ids: List[str]) -> Dict[str, str]:
+    """
+    product_rec_id -> "Product ID" (human)
+    """
+    if not product_rec_ids:
+        return {}
+
+    products_table = get_airtable_table(AIRTABLE_TABLE_PRODUCTS)
+    out: Dict[str, str] = {}
+
+    for chunk in chunked(product_rec_ids, 50):
+        or_part = ",".join([f"RECORD_ID()='{rid}'" for rid in chunk])
+        formula = f"OR({or_part})"
+
+        recs = products_table.all(formula=formula, fields=[PRODUCTS_FIELD_PRODUCT_ID])
+        for r in recs:
+            rid = r.get("id")
+            fields = r.get("fields", {}) or {}
+            pid = (fields.get(PRODUCTS_FIELD_PRODUCT_ID) or "").strip()
+            if rid and pid:
+                out[rid] = pid
+
+    return out
+
+
+def fetch_units_per_box_map() -> Dict[str, int]:
+    """
+    product_rec_id -> units_per_box
+    Table: Shiping Box sizes cm
+    Fields:
+      - Products (linked, can be multiple)
+      - Кол-во в коробке (number)
+    """
+    boxes_table = get_airtable_table(AIRTABLE_TABLE_BOXES)
+    recs = boxes_table.all(fields=[BOX_FIELD_PRODUCTS_LINK, BOX_FIELD_UNITS])
+
+    out: Dict[str, int] = {}
+    for r in recs:
+        f = r.get("fields", {}) or {}
+        prod_ids = as_list(f.get(BOX_FIELD_PRODUCTS_LINK))
+        units_raw = f.get(BOX_FIELD_UNITS)
+
+        if units_raw is None:
+            continue
+        try:
+            units = int(units_raw)
+        except Exception:
+            continue
+        if units <= 0:
+            continue
+
+        for pid in prod_ids:
+            if not pid:
+                continue
+            # если продукт встречается в нескольких строках — оставим первое (или можно валидировать)
+            out.setdefault(pid, units)
+
+    return out
+
+
+@app.post("/calc/interval-demand-cartons")
+def calc_interval_demand_cartons(req: CalcRequest) -> Dict[str, Any]:
+    """
+    То же, что interval-demand, но добавляет расчёт коробок:
+    - округляем всегда вверх
+    - считаем overstock_units / overstock_pct
+    - если нет коробки/продукта — status=ERROR
+    """
+    base = _calc_interval_demand_internal(req)
+    rows = base.get("rows", [])
+
+    listing_ids = [r["listing_id"] for r in rows if r.get("listing_id")]
+    listing_to_product = fetch_productmarket_listing_to_product(listing_ids)
+    units_per_box_map = fetch_units_per_box_map()
+
+    # (опционально) вернём Product ID строкой, чтобы менеджеру было проще
+    product_rec_ids = list({pid for pid in listing_to_product.values()})
+    productid_map = fetch_products_product_id(product_rec_ids)
+
+    total_cartons = 0
+    total_rounded_units = 0.0
+    total_overstock_units = 0.0
+
+    new_rows: List[Dict[str, Any]] = []
+
+    for r in rows:
+        listing_id = r.get("listing_id")
+        need_units = float(r.get("order_qty") or 0)
+
+        product_rec_id = listing_to_product.get(listing_id)
+        product_id_human = productid_map.get(product_rec_id, "") if product_rec_id else ""
+
+        if not product_rec_id:
+            new_rows.append({
+                **r,
+                "product_record_id": None,
+                "product_id": product_id_human,
+                "units_per_box": None,
+                "cartons": None,
+                "rounded_units": None,
+                "overstock_units": None,
+                "overstock_pct": None,
+                "status": "ERROR",
+                "error_reason": "PRODUCT_NOT_FOUND_IN_PRODUCTMARKET",
+            })
+            continue
+
+        units_per_box = units_per_box_map.get(product_rec_id)
+        if not units_per_box:
+            new_rows.append({
+                **r,
+                "product_record_id": product_rec_id,
+                "product_id": product_id_human,
+                "units_per_box": None,
+                "cartons": None,
+                "rounded_units": None,
+                "overstock_units": None,
+                "overstock_pct": None,
+                "status": "ERROR",
+                "error_reason": "BOX_NOT_FOUND_FOR_PRODUCT",
+            })
+            continue
+
+        if need_units <= 0:
+            new_rows.append({
+                **r,
+                "product_record_id": product_rec_id,
+                "product_id": product_id_human,
+                "units_per_box": units_per_box,
+                "cartons": 0,
+                "rounded_units": 0,
+                "overstock_units": 0,
+                "overstock_pct": 0,
+                "status": "OK",
+            })
+            continue
+
+        cartons = int(math.ceil(need_units / units_per_box))
+        rounded_units = cartons * units_per_box
+        overstock_units = rounded_units - need_units
+        overstock_pct = (overstock_units / need_units) if need_units > 0 else 0
+
+        total_cartons += cartons
+        total_rounded_units += float(rounded_units)
+        total_overstock_units += float(overstock_units)
+
+        new_rows.append({
+            **r,
+            "product_record_id": product_rec_id,
+            "product_id": product_id_human,        # удобно для менеджера
+            "units_per_box": units_per_box,
+            "cartons": cartons,
+            "rounded_units": round(float(rounded_units), 4),
+            "overstock_units": round(float(overstock_units), 4),
+            "overstock_pct": round(float(overstock_pct), 6),
+            "status": "OK",
+        })
+
+    base["rows"] = new_rows
+    base["totals"] = {
+        **(base.get("totals") or {}),
+        "cartons": total_cartons,
+        "rounded_units": round(total_rounded_units, 4),
+        "overstock_units": round(total_overstock_units, 4),
+    }
+    return base
+
+
 # ======================
 # DEBUG ENDPOINTS (SAFE)
 # ======================
@@ -179,13 +407,9 @@ def require_debug_token(token: str):
 
 @app.get("/debug/sample")
 def debug_sample(limit: int = 5, token: str = ""):
-    """
-    Returns a few raw rows so we can inspect how Airtable returns fields.
-    If DEBUG_TOKEN is set in env, you must pass ?token=...
-    """
     require_debug_token(token)
 
-    table = get_airtable_table()
+    table = get_airtable_table_daily()
 
     recs = table.all(
         max_records=limit,
@@ -202,12 +426,8 @@ def debug_sample(limit: int = 5, token: str = ""):
 
 @app.get("/debug/interval")
 def debug_interval(start: str, end: str, market: str = "", limit: int = 5, token: str = ""):
-    """
-    Shows sample rows for a date interval and optionally market filtering (in python).
-    """
     require_debug_token(token)
 
-    # validate dates
     start_dt = parse_date(start)
     end_dt = parse_date(end)
     if end_dt < start_dt:
@@ -216,12 +436,12 @@ def debug_interval(start: str, end: str, market: str = "", limit: int = 5, token
     end_excl = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
     start_str = start_dt.strftime("%Y-%m-%d")
 
-    table = get_airtable_table()
+    table = get_airtable_table_daily()
     formula = build_date_filter(start_str, end_excl)
 
     recs = table.all(
         formula=formula,
-        max_records=200,  # fetch more then filter
+        max_records=200,
         fields=[F_DATE, F_LISTING_ID, F_MARKET, F_FORECAST]
     )
 
