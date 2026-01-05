@@ -1,4 +1,4 @@
-import os
+   import os
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
 
@@ -21,7 +21,7 @@ AIRTABLE_TABLE_BOX = os.getenv("AIRTABLE_TABLE_BOX", "tblLoWfbXpNlJoTjz")
 
 F_DATE = os.getenv("AIRTABLE_FIELD_DATE", "Date")
 F_LISTING_ID = os.getenv("AIRTABLE_FIELD_LISTING_ID", "Listing ID")
-F_MARKET = os.getenv("AIRTABLE_FIELD_MARKET", "Marketplace")
+F_MARKET = os.getenv("AIRTABLE_FIELD_MARKET", "Marketplace (from Marketplace) (from Listing ID)")
 F_FORECAST = os.getenv("AIRTABLE_FIELD_FORECAST", "Planned units")
 
 
@@ -46,13 +46,14 @@ def parse_date(s: str) -> datetime:
 
 def build_filter(market: str, start: str, end_exclusive: str) -> str:
     """
-    Работает для:
-    - Date поля
-    - ISO-строк YYYY-MM-DD
+    Формула фильтра для Airtable.
+    Используем lookup-поле "Marketplace (from Marketplace) (from Listing ID)"
+    которое содержит список значений типа ["USA"]
     """
+    # Для lookup-полей со списками используем FIND
     return (
         f"AND("
-        f"{{{F_MARKET}}} = '{market}',"
+        f"FIND('{market}', ARRAYJOIN({{{F_MARKET}}})) > 0,"
         f"{{{F_DATE}}} >= '{start}',"
         f"{{{F_DATE}}} < '{end_exclusive}'"
         f")"
@@ -207,19 +208,24 @@ def calc_interval_demand(req: CalcRequest) -> Dict[str, Any]:
         try:
             pm_rec = table_pm.get(listing_id)
             pm_records.append(pm_rec)
+            print(f"✓ Loaded ProductMarket {listing_id}")
         except Exception as e:
-            print(f"Warning: Could not load ProductMarket {listing_id}: {e}")
+            print(f"✗ Warning: Could not load ProductMarket {listing_id}: {e}")
             continue
+    
+    print(f"Loaded {len(pm_records)} ProductMarket records")
     
     # Загружаем Box records
     table_box = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_BOX)
     box_records = table_box.all(fields=["Кол-во в коробке"])
+    print(f"Loaded {len(box_records)} Box records")
     
     # Строим маппинг listing_id -> units_per_carton
     listing_to_box = build_box_map_from_productmarket(
         pm_records, 
         box_records
     )
+    print(f"Built box mapping with {len(listing_to_box)} entries: {listing_to_box}")
 
     # 4. Формируем строки с расчётами
     rows: List[Dict[str, Any]] = []
