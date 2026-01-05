@@ -131,11 +131,20 @@ def calc_interval_demand(req: CalcRequest) -> Dict[str, Any]:
         aggregated[listing_id] = aggregated.get(listing_id, 0.0) + units
 
     # 3. Получаем данные о коробках
-    # Загружаем ProductMarket
+    # Загружаем только нужные ProductMarket records (по listing_ids из aggregated)
     table_pm = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_PRODUCTMARKET)
-    pm_records = table_pm.all(fields=["Product and Box sizes cm"])
     
-    # Загружаем Box
+    # Загружаем каждый ProductMarket record по ID
+    pm_records = []
+    for listing_id in aggregated.keys():
+        try:
+            pm_rec = table_pm.get(listing_id)
+            pm_records.append(pm_rec)
+        except Exception as e:
+            print(f"Warning: Could not load ProductMarket {listing_id}: {e}")
+            continue
+    
+    # Загружаем Box records
     table_box = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_BOX)
     box_records = table_box.all(fields=["Кол-во в коробке"])
     
