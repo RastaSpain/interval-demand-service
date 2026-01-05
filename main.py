@@ -226,6 +226,21 @@ def calc_interval_demand(req: CalcRequest) -> Dict[str, Any]:
         box_records
     )
     print(f"Built box mapping with {len(listing_to_box)} entries: {listing_to_box}")
+    
+    # Строим маппинг listing_id -> product info для читаемых названий
+    listing_to_product_info: Dict[str, Dict[str, Any]] = {}
+    for pm_rec in pm_records:
+        pm_id = pm_rec.get("id")
+        fields = pm_rec.get("fields") or {}
+        
+        if pm_id:
+            listing_to_product_info[pm_id] = {
+                "key_product_market": fields.get("KeyProductMarket", ""),
+                "asin": fields.get("ASIN", ""),
+                "sku": fields.get("SKU", ""),
+            }
+    
+    print(f"Built product info mapping for {len(listing_to_product_info)} listings")
 
     # 4. Формируем строки с расчётами
     rows: List[Dict[str, Any]] = []
@@ -237,9 +252,15 @@ def calc_interval_demand(req: CalcRequest) -> Dict[str, Any]:
             start_stock = float(req.start_stock.get(listing_id, 0) or 0)
 
         order_qty = max(0.0, forecast_units - start_stock)
+        
+        # Получаем product info
+        product_info = listing_to_product_info.get(listing_id, {})
 
         rows.append({
             "listing_id": listing_id,
+            "key_product_market": product_info.get("key_product_market", "UNKNOWN"),
+            "asin": product_info.get("asin", ""),
+            "sku": product_info.get("sku", ""),
             "forecast_units": round(forecast_units, 2),
             "start_stock": round(start_stock, 2),
             "safety_units": 0.0,
