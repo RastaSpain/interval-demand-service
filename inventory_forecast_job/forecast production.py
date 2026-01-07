@@ -1,147 +1,161 @@
 #!/usr/bin/env python3
 """
-Amazon Inventory Forecast - Production Script
-Базовый прогноз остатков для всех товаров и marketplace
+Amazon Inventory Forecast - Webhook-ready Production Script
 
-Поддерживаемые marketplace: USA, CA, UK, DE
-Логика:
-- Starting Stock = PHYSICAL_FBA_STOCK + AWD
-- Inbound Expected = INBOUND_TOTAL (все прибывает в срок)
-- Sales Planned = реальные данные из Sales Plan Daily
-- Projected Stock = Starting Stock + Inbound Expected - Sales Planned
+Запуск:
+- Через FastAPI endpoint (см. app.py)
+- Рассчитывает прогноз по всем товарам и marketplace
+- Берёт последние остатки по asin+marketplace
+- Sales Planned берёт из Sales Plan Daily за период TODAY..TARGET
+- Сохраняет результат в Airtable Results
+
+ВАЖНО:
+- Germany (DE) без данных НЕ вызывает ошибку: marketplace просто пропустится.
 """
 
 import os
-import sys
 import requests
-from datetime import date, datetime
-import json
-from typing import Dict, List, Optional
+from datetime import date
+from typing import Dict, List, Optional, Any
+
 
 # ============================================================================
-# КОНФИГУРАЦИЯ
+# CONFIG
 # ============================================================================
 
-# Airtable credentials (через environment variables)
 AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN")
 BASE_ID = os.environ.get("AIRTABLE_BASE_ID", "appHbiHFRAWtx2ErO")
 
 if not AIRTABLE_TOKEN:
-    print("❌ ERROR: AIRTABLE_TOKEN environment variable not set!")
-    print("   Set it with: export AIRTABLE_TOKEN='your_token'")
-    sys.exit(1)
+    raise RuntimeError("AIRTABLE_TOKEN environment variable not set")
 
 HEADERS = {
     "Authorization": f"Bearer {AIRTABLE_TOKEN}",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
 }
 
-# Таблицы
-TABLE_INVENTORY = "tblvdUXLGMbN5rVJL"  # Остатки Амазон
+# Airtable Table IDs (как у тебя)
+TABLE_INVENTORY = "tblvdUXLGMbN5rVJL"   # Остатки Амазон
 TABLE_SALES_PLAN = "tblRLB6E83lHg6h7b"  # Sales Plan Daily
 TABLE_RESULTS = "tblU17E0bqiQ8PMfD"     # Inventory Forecast Results
 
-# Даты расчета (можно передать через аргументы)
-TODAY = date.today()
-TARGET_DATE = date(2026, 4, 1)  # По умолчанию
+DEFAULT_MARKETPLACES = ["USA", "CA", "UK", "DE"]
 
-# Marketplace для расчета (все активные)
-MARKETPLACES = ["USA", "CA", "UK", "DE"]
 
 # ============================================================================
-# ФУНКЦИИ AIRTABLE API
+# AIRTABLE HELPERS
 # ============================================================================
 
-def get_records(table_id: str, formula: str = None, fields: List[str] = None) -> List[Dict]:
-    """Получить записи из таблицы Airtable"""
+def get_records(table_id: str, formula: str = None, fields: List[str] = None) -> List[Dict[str, Any]]:
     url = f"https://api.airtable.com/v0/{BASE_ID}/{table_id}"
-    params = {"pageSize": 100}
-    
+    params: Dict[str, Any] = {"pageSize": 100}
+
     if formula:
         params["filterByFormula"] = formula
     if fields:
-        for field in fields:
-            params.setdefault("fields[]", []).append(field)
-    
-    all_records = []
+        # Airtable expects repeated fields[] query params
+        params["fields[]"] = fields
+
+    all_records: List[Dict[str, Any]] = []
     while True:
-        try:
-            response = requests.get(url, headers=HEADERS, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            all_records.extend(data.get("records", []))
-            
-            if "offset" in data:
-                params["offset"] = data["offset"]
-            else:
-                break
-        except Exception as e:
-            print(f"❌ Error fetching records: {e}")
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        all_records.extend(data.get("records", []))
+
+        offset = data.get("offset")
+        if offset:
+            params["offset"] = offset
+        else:
             break
-    
+
     return all_records
 
 
-def create_records(table_id: str, records: List[Dict]) -> List[Dict]:
-    """Создать записи в таблице Airtable (батчами по 10)"""
+def create_records(table_id: str, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     url = f"https://api.airtable.com/v0/{BASE_ID}/{table_id}"
-    
-    results = []
+    created: List[Dict[str, Any]] = []
+
+    # Airtable batch limit 10
     for i in range(0, len(records), 10):
-        batch = records[i:i+10]
+        batch = records[i:i + 10]
         payload = {"records": batch}
-        
-        try:
-            response = requests.post(url, headers=HEADERS, json=payload, timeout=30)
-            response.raise_for_status()
-            results.extend(response.json().get("records", []))
-        except Exception as e:
-            print(f"❌ Error creating records (batch {i//10 + 1}): {e}")
-    
-    return results
+        resp = requests.post(url, headers=HEADERS, json=payload, timeout=30)
+        resp.raise_for_status()
+        created.extend(resp.json().get("records", []))
+
+    return created
 
 
 # ============================================================================
-# ПОЛУЧЕНИЕ ДАННЫХ
+# DATA FETCH
 # ============================================================================
 
-def get_all_products_inventory(marketplace: str = None) -> List[Dict]:
-    """Получить остатки для всех товаров (опционально по marketplace)"""
+def get_all_products_inventory(marketplace: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Берём все записи inventory, фильтруем, и выбираем latest по asin+marketplace.
+    Ожидается, что в таблице есть поля:
+      - asin
+      - Marketplace (from Maketplace)  (linked/lookup list)
+      - Product ID (from Products)     (lookup list)
+      - PHYSICAL_FBA_STOCK
+      - AWD
+      - INBOUND_TOTAL
+      - lastUpdatedTime
+    """
+
     formula_parts = ['NOT({Product ID (from Products)} = "")']
-    
     if marketplace:
+        # Пытаемся отфильтровать marketplace
         formula_parts.append(f'FIND("{marketplace}", {{Marketplace (from Maketplace)}})')
-    
+
     formula = f"AND({', '.join(formula_parts)})"
-    
+
     records = get_records(TABLE_INVENTORY, formula=formula)
-    
-    # Группируем по ASIN-Marketplace и берем последние записи
-    latest_records = {}
-    for record in records:
-        fields = record["fields"]
-        asin = fields.get("asin")
-        mp = fields.get("Marketplace (from Maketplace)", [""])[0]
-        last_updated = fields.get("lastUpdatedTime", "")
-        
+
+    latest: Dict[str, Dict[str, Any]] = {}
+
+    for r in records:
+        f = r.get("fields", {})
+
+        asin = f.get("asin")
+        if not asin:
+            continue
+
+        mp_list = f.get("Marketplace (from Maketplace)", [""])
+        mp = mp_list[0] if isinstance(mp_list, list) and mp_list else ""
+        if not mp:
+            continue
+
+        last_updated = f.get("lastUpdatedTime", "")
+
         key = f"{asin}-{mp}"
-        
-        if key not in latest_records or last_updated > latest_records[key].get("lastUpdatedTime", ""):
-            latest_records[key] = {
+
+        current = latest.get(key)
+        # сравниваем строкой (ISO обычно сравнимо)
+        if (current is None) or (last_updated and last_updated > current.get("last_updated", "")):
+            product_id_list = f.get("Product ID (from Products)", [""])
+            product_id = product_id_list[0] if isinstance(product_id_list, list) and product_id_list else ""
+
+            latest[key] = {
                 "asin": asin,
                 "marketplace": mp,
-                "product_id": fields.get("Product ID (from Products)", [""])[0],
-                "physical_fba_stock": fields.get("PHYSICAL_FBA_STOCK", 0),
-                "awd": fields.get("AWD", 0),
-                "inbound_total": fields.get("INBOUND_TOTAL", 0),
+                "product_id": product_id,
+                "physical_fba_stock": f.get("PHYSICAL_FBA_STOCK", 0) or 0,
+                "awd": f.get("AWD", 0) or 0,
+                "inbound_total": f.get("INBOUND_TOTAL", 0) or 0,
                 "last_updated": last_updated,
             }
-    
-    return list(latest_records.values())
+
+    return list(latest.values())
 
 
-def get_sales_plan(asin: str, marketplace: str, start_date: date, end_date: date) -> Dict:
-    """Получить Sales Plan для товара за период"""
+def get_sales_plan(asin: str, marketplace: str, start_date: date, end_date: date) -> Dict[str, Any]:
+    """
+    Достаём записи Sales Plan Daily за период и суммируем Planned units.
+    Важно: Airtable поля должны совпадать с формулой.
+    """
+
     formula = (
         f'AND('
         f'FIND("{asin}", {{ASIN (from Listing ID) 2}}), '
@@ -150,225 +164,178 @@ def get_sales_plan(asin: str, marketplace: str, start_date: date, end_date: date
         f'{{Date}} <= "{end_date.isoformat()}"'
         f')'
     )
-    
+
     records = get_records(TABLE_SALES_PLAN, formula=formula)
-    
-    # Суммируем Planned units
-    total_sales = sum(r["fields"].get("Planned units", 0) for r in records)
-    days_diff = (end_date - start_date).days
-    
+
+    total_units = 0
+    for r in records:
+        total_units += r.get("fields", {}).get("Planned units", 0) or 0
+
+    period_days = max((end_date - start_date).days, 0)
+    avg_daily = (total_units / period_days) if period_days > 0 else 0
+
     return {
-        "total_units": total_sales,
+        "total_units": float(total_units),
         "days_count": len(records),
-        "avg_daily": total_sales / days_diff if days_diff > 0 else 0,
-        "period_days": days_diff
+        "period_days": period_days,
+        "avg_daily": float(avg_daily),
     }
 
 
 # ============================================================================
-# РАСЧЕТ ПРОГНОЗА
+# FORECAST
 # ============================================================================
 
 def calculate_forecast(
-    asin: str, 
-    marketplace: str,
-    inventory: Dict,
+    inventory: Dict[str, Any],
     start_date: date,
     end_date: date,
-    verbose: bool = True
-) -> Optional[Dict]:
-    """Рассчитать прогноз для товара"""
-    
-    if verbose:
-        print(f"\n{'─'*80}")
-        print(f"📊 {inventory.get('product_id', 'Unknown')} ({asin}) - {marketplace}")
-        print(f"{'─'*80}")
-    
-    # 1. Starting Stock
-    starting_stock = inventory['physical_fba_stock'] + inventory['awd']
-    
-    if verbose:
-        print(f"Starting Stock: {starting_stock} (FBA: {inventory['physical_fba_stock']}, AWD: {inventory['awd']})")
-    
-    # 2. Inbound Expected
-    inbound_expected = inventory['inbound_total']
-    
-    if verbose:
-        print(f"Inbound Expected: {inbound_expected}")
-    
-    # 3. Sales Planned
+    verbose: bool = False,
+) -> Optional[Dict[str, Any]]:
+    asin = inventory["asin"]
+    marketplace = inventory["marketplace"]
+
+    starting_stock = (inventory["physical_fba_stock"] or 0) + (inventory["awd"] or 0)
+    inbound_expected = inventory["inbound_total"] or 0
+
     sales = get_sales_plan(asin, marketplace, start_date, end_date)
-    sales_planned = sales['total_units']
-    
-    if verbose:
-        print(f"Sales Planned: {sales_planned:.2f} ({sales['days_count']} days, avg: {sales['avg_daily']:.2f}/day)")
-    
-    # 4. Прогноз
+    sales_planned = sales["total_units"]
+
     projected_stock = starting_stock + inbound_expected - sales_planned
-    days_supply = int(projected_stock / sales['avg_daily']) if sales['avg_daily'] > 0 else 0
-    
+    days_supply = int(projected_stock / sales["avg_daily"]) if sales["avg_daily"] > 0 else 0
+
     if verbose:
-        print(f"➡️  Projected: {projected_stock:.0f} units, {days_supply} days supply")
-        
-        if days_supply < 30:
-            print(f"   ⚠️  LOW STOCK WARNING!")
-        if projected_stock < 0:
-            print(f"   🚨 CRITICAL: Negative stock!")
-    
+        print(f"\n--- {inventory.get('product_id','Unknown')} ({asin}) [{marketplace}] ---")
+        print(f"Start: {starting_stock} (FBA {inventory['physical_fba_stock']}, AWD {inventory['awd']})")
+        print(f"Inbound: {inbound_expected}")
+        print(f"Sales planned: {sales_planned} (avg {sales['avg_daily']}/day)")
+        print(f"Projected: {projected_stock} | Days supply: {days_supply}")
+
     return {
         "asin": asin,
         "marketplace": marketplace,
-        "product_id": inventory.get('product_id', ''),
-        "starting_stock_fba": inventory['physical_fba_stock'],
-        "starting_stock_awd": inventory['awd'],
-        "starting_stock_total": starting_stock,
-        "inbound_expected": inbound_expected,
-        "sales_planned": sales_planned,
+        "product_id": inventory.get("product_id", ""),
+        "starting_stock_fba": int(inventory["physical_fba_stock"]),
+        "starting_stock_awd": int(inventory["awd"]),
+        "starting_stock_total": int(starting_stock),
+        "inbound_expected": int(inbound_expected),
+        "sales_planned": float(sales_planned),
         "projected_stock": int(projected_stock),
-        "days_of_supply": days_supply,
-        "avg_daily_sales": sales['avg_daily'],
+        "days_of_supply": int(days_supply),
+        "avg_daily_sales": float(sales["avg_daily"]),
     }
 
 
-# ============================================================================
-# СОХРАНЕНИЕ РЕЗУЛЬТАТОВ
-# ============================================================================
-
-def save_forecast_results(forecasts: List[Dict], start_date: date, end_date: date) -> List[Dict]:
-    """Сохранить результаты прогноза в Airtable"""
-    
+def save_forecast_results(
+    forecasts: List[Dict[str, Any]],
+    start_date: date,
+    end_date: date
+) -> int:
     if not forecasts:
-        print("\n❌ No forecasts to save")
-        return []
-    
-    records = []
+        return 0
+
+    records: List[Dict[str, Any]] = []
     for f in forecasts:
         records.append({
             "fields": {
-                "ASIN": f['asin'],
-                "Marketplace": f['marketplace'],
-                "Product ID": f['product_id'],
+                "ASIN": f["asin"],
+                "Marketplace": f["marketplace"],
+                "Product ID": f["product_id"],
                 "Calculation Date": start_date.isoformat(),
                 "Target Date": end_date.isoformat(),
                 "Scenario": "base",
-                
-                "Current Stock Total": f['starting_stock_total'],
-                "Stock AWD": f['starting_stock_awd'],
-                "Inbound Expected": f['inbound_expected'],
-                "Sales Planned": f['sales_planned'],
-                "Projected Stock": f['projected_stock'],
-                "Days of Supply": f['days_of_supply'],
-                
+
+                "Current Stock Total": f["starting_stock_total"],
+                "Stock AWD": f["starting_stock_awd"],
+                "Inbound Expected": f["inbound_expected"],
+                "Sales Planned": f["sales_planned"],
+                "Projected Stock": f["projected_stock"],
+                "Days of Supply": f["days_of_supply"],
+
                 "Validation Status": "NOT_CHECKED",
                 "Notes": f"Auto-generated forecast. Period: {start_date} to {end_date}"
             }
         })
-    
-    print(f"\n{'='*80}")
-    print(f"💾 Saving {len(records)} forecast(s) to Airtable...")
-    print(f"{'='*80}")
-    
+
     created = create_records(TABLE_RESULTS, records)
-    
-    print(f"✅ Successfully saved {len(created)} records")
-    
-    return created
+    return len(created)
 
 
 # ============================================================================
-# MAIN
+# PUBLIC ENTRY (for webhook)
 # ============================================================================
 
-def main():
-    """Основная функция"""
-    
-    print(f"\n{'='*80}")
-    print(f"🚀 AMAZON INVENTORY FORECAST - PRODUCTION")
-    print(f"{'='*80}")
-    print(f"📅 Calculation Date: {TODAY}")
-    print(f"🎯 Target Date: {TARGET_DATE}")
-    print(f"⏱️  Period: {(TARGET_DATE - TODAY).days} days")
-    print(f"🌍 Marketplaces: {', '.join(MARKETPLACES)}")
-    
-    all_forecasts = []
-    
-    # Расчет по каждому marketplace
-    for marketplace in MARKETPLACES:
-        print(f"\n{'='*80}")
-        print(f"🌍 MARKETPLACE: {marketplace}")
-        print(f"{'='*80}")
-        
-        # Получаем остатки для всех товаров в marketplace
-        products = get_all_products_inventory(marketplace)
-        
-        if not products:
-            print(f"⚠️  No inventory data found for {marketplace}")
-            continue
-        
-        print(f"Found {len(products)} product(s) in {marketplace}")
-        
-        # Рассчитываем прогноз для каждого товара
-        for inventory in products:
-            try:
-                forecast = calculate_forecast(
-                    asin=inventory['asin'],
-                    marketplace=marketplace,
-                    inventory=inventory,
-                    start_date=TODAY,
-                    end_date=TARGET_DATE,
-                    verbose=True
-                )
-                
-                if forecast:
-                    all_forecasts.append(forecast)
-                    
-            except Exception as e:
-                print(f"❌ Error calculating forecast for {inventory.get('asin')}: {e}")
-    
-    # Сохранение результатов
-    if all_forecasts:
-        print(f"\n{'='*80}")
-        print(f"📊 SUMMARY")
-        print(f"{'='*80}")
-        print(f"Total forecasts calculated: {len(all_forecasts)}")
-        
-        # Группировка по marketplace
-        by_marketplace = {}
-        for f in all_forecasts:
-            mp = f['marketplace']
-            by_marketplace.setdefault(mp, []).append(f)
-        
-        for mp, forecasts in by_marketplace.items():
-            print(f"  {mp}: {len(forecasts)} product(s)")
-        
-        # Сохраняем в Airtable
-        saved = save_forecast_results(all_forecasts, TODAY, TARGET_DATE)
-        
-        # Показываем предупреждения
-        print(f"\n{'='*80}")
-        print(f"⚠️  WARNINGS")
-        print(f"{'='*80}")
-        
-        low_stock = [f for f in all_forecasts if f['days_of_supply'] < 30]
-        critical_stock = [f for f in all_forecasts if f['projected_stock'] < 0]
-        
-        if low_stock:
-            print(f"\n🟡 Low Stock ({len(low_stock)} products):")
-            for f in low_stock:
-                print(f"  - {f['product_id']} ({f['marketplace']}): {f['days_of_supply']} days")
-        
-        if critical_stock:
-            print(f"\n🔴 Critical Stock ({len(critical_stock)} products):")
-            for f in critical_stock:
-                print(f"  - {f['product_id']} ({f['marketplace']}): {f['projected_stock']} units (NEGATIVE!)")
-        
-        if not low_stock and not critical_stock:
-            print("✅ All products have sufficient stock!")
-    
-    print(f"\n{'='*80}")
-    print(f"✅ FORECAST COMPLETED!")
-    print(f"{'='*80}")
+def run_forecast(
+    target_date: date,
+    marketplaces: Optional[List[str]] = None,
+    verbose: bool = False
+) -> Dict[str, Any]:
+    """
+    Главная функция: считает прогноз и сохраняет результаты.
+    Возвращает summary (удобно для n8n).
+    """
+    today = date.today()
+    marketplaces = marketplaces or DEFAULT_MARKETPLACES
 
+    all_forecasts: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
 
-if __name__ == "__main__":
-    main()
+    for mp in marketplaces:
+        try:
+            products = get_all_products_inventory(mp)
+            if not products:
+                # Нормально: по DE может быть пусто
+                continue
+
+            for inv in products:
+                try:
+                    f = calculate_forecast(inv, today, target_date, verbose=verbose)
+                    if f:
+                        all_forecasts.append(f)
+                except Exception as e:
+                    errors.append({"asin": inv.get("asin"), "marketplace": mp, "error": str(e)})
+
+        except Exception as e:
+            errors.append({"marketplace": mp, "error": str(e)})
+
+    saved_count = save_forecast_results(all_forecasts, today, target_date)
+
+    low_stock = [f for f in all_forecasts if f["days_of_supply"] < 30]
+    critical_stock = [f for f in all_forecasts if f["projected_stock"] < 0]
+
+    by_marketplace: Dict[str, int] = {}
+    for f in all_forecasts:
+        by_marketplace[f["marketplace"]] = by_marketplace.get(f["marketplace"], 0) + 1
+
+    return {
+        "ok": True,
+        "calculation_date": today.isoformat(),
+        "target_date": target_date.isoformat(),
+        "marketplaces_requested": marketplaces,
+        "forecasts_calculated": len(all_forecasts),
+        "forecasts_saved": saved_count,
+        "by_marketplace": by_marketplace,
+        "warnings": {
+            "low_stock_count": len(low_stock),
+            "critical_stock_count": len(critical_stock),
+            "low_stock": [
+                {
+                    "product_id": f["product_id"],
+                    "asin": f["asin"],
+                    "marketplace": f["marketplace"],
+                    "days_of_supply": f["days_of_supply"],
+                    "projected_stock": f["projected_stock"],
+                } for f in low_stock
+            ],
+            "critical_stock": [
+                {
+                    "product_id": f["product_id"],
+                    "asin": f["asin"],
+                    "marketplace": f["marketplace"],
+                    "days_of_supply": f["days_of_supply"],
+                    "projected_stock": f["projected_stock"],
+                } for f in critical_stock
+            ],
+        },
+        "errors": errors,
+    }
